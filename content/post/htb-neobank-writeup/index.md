@@ -1,7 +1,7 @@
 ---
 title: "HTB NeoBank Writeup"
 slug: htb-neobank
-image: img/neobank-landing-page.png
+image: img/landing-page.png
 categories:
 - CTF
 - Writeup
@@ -18,112 +18,415 @@ difficulty: Easy
 vulnerabilities: [IDOR, BOLA, API Versioning, Information Disclosure]
 ---
 
-# HTB NeoBank Writeup
+![HTB Instance Spawn](img/htb-instance-spawn.png)
 
-## Overview
+NeoBank is a simplified banking application. The objective is to identify security flaws in the application logic to access unauthorized data.
 
-**Platform**: HackTheBox  
-**Difficulty**: Easy  
-**Vulnerabilities**: IDOR, BOLA, API Versioning  
+![Landing Page](img/landing-page.png)
 
-NeoBank is a web application challenge that demonstrates how legacy API endpoints can introduce critical security flaws. The exploitation chain involves identifying an older API version (`v1`) that lacks proper object-level authorization (IDOR), leveraging information leakage to enumerate user IDs, and ultimately accessing another user's financial report to retrieve the flag.
+The application provides standard user authentication functionality with login and registration forms.
 
-![HTB Instance Spawn](img/neobank-instance-spawn.png)
+![Login Page](img/login-page.png)
 
 ---
 
-## Authentication & Initial Access
+## Authentication Testing
 
-The application presents a login and registration interface.
+### Login Page Analysis
 
-![Landing Page](img/neobank-landing-page.png)
+![Register Page](img/register-page.png)
 
-### Testing Login Security
-Standard SQL injection payloads (`' OR 1=1--`) and authentication bypass attempts on the login form were unsuccessful.
+**Testing performed:**
+- ✅ SQL Injection payloads: `' OR 1=1--`, `admin'--`, `' UNION SELECT`
+- ✅ Authentication bypass: Empty credentials, null bytes
+- ❌ No vulnerabilities found
 
-![SQLi Testing](img/neobank-auth-test.png)
-
-### Account Creation
-A legitimate test account was created to access the authenticated area of the application.
-
-![Account Creation](img/neobank-account-creation.png)
-
-![User Dashboard](img/neobank-dashboard.png)
+**Conclusion**: Login mechanism appears secure - moving to account creation.
 
 ---
 
-## Reconnaissance & Information Disclosure
+## Initial Access
 
-### Username Enumeration
-The transaction history on the dashboard discloses the usernames of other entities, specifically `neo_system`.
+### Creating a Test Account
 
-![Username Disclosure neo_system](img/neobank-username-disclosure.png)
+![User Dashboard](img/user-dashboard.png)
 
-### API Endpoint Discovery
-Reviewing the HTTP history in Burp Suite revealed distinct API versions being used:
+Account registration was successful, providing access to the application as a standard user.
 
-- `/api/v1/user/details` - Returns user information.
-- `/api/v2/download-report` - Handles financial report downloads.
+![Transaction History](img/transaction-history.png)
 
-The presence of `v1` and `v2` endpoints suggests multiple API versions exist, making the legacy `v1` endpoints a potential attack surface.
-
-![API Versions Discovery in Burp](img/neobank-api-discovery.png)
+The user dashboard provides access to account balance information, transaction history, and a feature to download financial reports.
 
 ---
 
-## Exploitation
+## Information Disclosure
 
-### Vulnerability 1: API Version Downgrade (IDOR)
+### Username Enumeration via Transaction History
 
-Analyzing the `/api/v2/download-report` request showed it relies on the session cookie to identify the user.
+![Financial Report Download](img/financial-report-download.png)
 
-Switching the request to the legacy endpoint `/api/v1/download-report` returned an error:
-```json
+**Finding**: Transaction history reveals username `neo_system`.
+
+**Vulnerability**: The application discloses other users' usernames in transaction records.
+
+**Impact**:
+- Username enumeration
+- Reconnaissance for targeted attacks
+- Potential privilege escalation if admin/system accounts are revealed
+
+**OWASP**: A01:2021 - Broken Access Control (Information Leakage)
+
+---
+
+## Testing Additional Features
+
+### Financial Report Analysis
+
+![Transfer Money](img/transfer-money.png)
+
+The financial report feature generates a PDF containing the user's transaction history.
+
+### Injection Testing on Transaction Description
+
+![Encoding Check](img/encoding-check.png)
+
+**Payloads tested:**
+- XSS: `<script>alert(1)</script>`, `<img src=x onerror=alert(1)>`
+- SSTI: `{{7*7}}`, `${7*7}`, `<%= 7*7 %>`
+- HTML Injection: `<h1>Test</h1>`
+
+**Result**: Special characters are HTML-encoded, preventing injection attacks.
+
+![Encoding Check Report](img/encoding-check-report.png)
+
+The encoding is also applied in the downloaded PDF report, confirming proper output encoding.
+
+---
+
+## API Version Analysis
+
+### Request History Analysis
+
+![User ID Discovered](img/user-id-discovered.png)
+
+**Key Finding**: Reviewing proxy history revealed endpoints containing user IDs.
+
+**Identified Endpoints:**
+- `/api/v1/user/details` - Returns user information including `userid`
+- `/api/v2/download-report` - Downloads financial reports
+- `/api/v1/download-report` - Legacy endpoint (to be tested)
+
+This suggests the application has **multiple API versions** - a common source of security vulnerabilities.
+
+---
+
+## Vulnerability #2: API Version Downgrade Attack
+
+### Testing Legacy v1 Endpoint
+
+![Manipulate API endpoint](img/manipulate-api-endpoint.png)
+
+Intercepted the download report request to analyze the API call structure.
+
+![v1 requires id parameter](img/v1-requires-id-parameter.png)
+
+**Attack Vector Discovered:**
+
+Changed the API endpoint from:
+```http
+GET /api/v2/download-report HTTP/1.1
+```
+
+To:
+```http
+GET /api/v1/download-report HTTP/1.1
+```
+
+**Response**: The v1 endpoint returns an error requesting an `_id` parameter!
+
+```http
+HTTP/1.1 400 Bad Request
 {"error": "Missing required parameter: _id"}
 ```
 
-This error indicates that the `v1` endpoint expects a user-controlled `_id` parameter, unlike `v2` which derives the user identity from the session. This is a classic Insecure Direct Object Reference (IDOR) vulnerability.
+**Analysis:**
+- **v2 Behavior**: Uses session/token to determine which user's report to download (secure)
+  ```python
+  user_id = get_from_session()  # Server-controlled
+  ```
+- **v1 Behavior**: Requires an `_id` parameter from user input (vulnerable to IDOR)
+  ```python
+  user_id = request.args.get('_id')  # User-controlled ⚠️
+  ```
 
-![v1 requires id parameter](img/neobank-v1-check.png)
+**The Critical Difference:**
+v2 trusts the **server** (session). v1 trusts the **user** (parameter). Never trust user input for authorization decisions.
 
-### Vulnerability 2: User Enumeration Chain
+---
 
-To exploit the IDOR, a valid target `userid` is required. The `/api/v1/user/details` endpoint was found to allow querying user details by username.
+## Vulnerability #3: Chained IDOR Attack
 
-**Attack Step 1: Get Target User ID**
-Using the username `neo_system` found in the transaction history:
+### Step 1: Obtaining Target UserID
+
+![neo_system userid report request](img/neo-system-userid-report-request.png)
+
+We already know the username `neo_system` from the transaction history.
+
+![IDOR Test on neo_system](img/idor-test-on-neo-system.png)
+
+**Exploitation:**
+
+Used the discovered information to craft the attack:
+
+```http
+GET /api/v1/download-report?_id=<neo_system_userid> HTTP/1.1
+Cookie: session=<our_session>
+```
+
+Where `<neo_system_userid>` was obtained from previous endpoint responses.
+
+### Step 2: Accessing neo_system's Report
+
+![neo_system financial reports](img/neo-system-financial-reports.png)
+
+**Success!** We successfully accessed `neo_system`'s financial report.
+
+**Finding**: The report doesn't contain the flag, but reveals another username: `user_with_flag`
+
+**Vulnerability Confirmed**: 
+- **Type**: IDOR (Insecure Direct Object Reference) / BOLA (Broken Object Level Authorization)
+- **Root Cause**: Legacy v1 API doesn't validate if the authenticated user owns the requested `_id`
+- **Authentication ≠ Authorization**: App checks IF you're logged in, not WHAT you can access
+
+---
+
+## Vulnerability #4: Username to UserID Enumeration
+
+### Discovering the Conversion Endpoint
+
+![User details API endpoint](img/user-details-api-endpoint.png)
+
+**Endpoint Found**: `/api/v1/user/details?username=<target_username>`
+
+This endpoint allows converting any username to their corresponding `userid` without proper authorization checks.
+
+### Exploiting Username Enumeration
+
+![user_with_flag user_id disclosure](img/user-with-flag-user-id-disclosure.png)
+
+**Attack:**
+
 ```http
 GET /api/v1/user/details?username=user_with_flag HTTP/1.1
-```
-(Initially tested with `neo_system`, which revealed the flag user's username is likely `user_with_flag` or similar, or the `neo_system` report itself contained a reference).
-
-*Correction based on previous findings*: Accessing `neo_system`'s report revealed a transaction with `user_with_flag`.
-
-![victim user_id disclosure](img/neobank-victim-id-leak.png)
-
-**Attack Step 2: Download Victim Report**
-With the `userid` for `user_with_flag` obtained, the IDOR on the download endpoint can be triggered:
-
-```http
-GET /api/v1/download-report?_id=<target_userid> HTTP/1.1
-Cookie: session=<valid_session>
+Cookie: session=<our_session>
 ```
 
-![Flag Captured](img/neobank-flag.png)
-
-### Flag Retrieval
-The response contains the financial report for the target user, which includes the flag.
-
+**Response:**
+```json
+{
+  "username": "user_with_flag",
+  "userid": "<flag_user_id>",
+  ...
+}
 ```
-HTB{flag_content_here}
+
+**Vulnerability**: Another IDOR - any authenticated user can query details of ANY username.
+
+**Impact Multiplier:** This endpoint enables mass exploitation. An attacker could:
+1. Enumerate usernames (from transaction history, public profiles, etc.)
+2. Batch convert them to IDs
+3. Download all users' financial reports
+4. Exfiltrate entire database of customer data
+
+---
+
+## Flag Retrieval
+
+### Success!
+
+![Flag Captured](img/flag-captured.png)
+
+**Flag captured!** The financial report for `HTB{n0t_s0_3asy_1d0r}` contains the final flag.
+
+---
+
+## Complete Attack Chain
+
+```text
+[Create Account & Login]
+        ↓
+[Transaction History reveals neo_system]
+        ↓
+[Discover API v1/v2 endpoints]
+        ↓
+[Test v1 endpoint - requires _id parameter]
+        ↓
+[Find neo_system userid]
+        ↓
+[Access neo_system report via v1 IDOR]
+        ↓
+[Discover user_with_flag username]
+        ↓
+[Use /api/v1/user/details?username=user_with_flag]
+        ↓
+[Get user_with_flag userid]
+        ↓
+[Access user_with_flag report via v1 IDOR]
+        ↓
+[🚩 FLAG CAPTURED!]
 ```
 
 ---
 
-## Remediation
+## Vulnerability Summary
 
-The root cause is the failure to disable or secure the legacy `v1` API endpoint which implemented insecure authorization checks.
+| # | **Vulnerability** | **Endpoint** | **Severity** | **Impact** |
+|---|---|---|---|---|
+| 3 | **IDOR - Report Access** | `/api/v1/download-report?_id=` | Critical | Unauthorized access to financial reports |
+| 4 | **IDOR - User Details** | `/api/v1/user/details?username=` | High | Enumerate any user's details |
 
-1.  **Deprecate and Remove Legacy Endpoints**: Old API versions (`v1`) should be disabled if they are no longer needed.
-2.  **Implement Object-Level Authorization**: Ensure that the authenticated user is authorized to access the requested resource ID.
-3.  **Avoid Direct Object References**: Use indirect references (like session-based ID retrieval) rather than trusting user input for resource identification.
+---
+
+## Root Cause Analysis
+
+### Why This Vulnerability Exists
+
+**Problem**: The development team created API v2 to fix security issues in v1, but **failed to disable the legacy v1 endpoints**.
+
+**Code Comparison:**
+
+#### Vulnerable v1 Implementation ❌
+```python
+@app.route('/api/v1/download-report')
+def download_report_v1():
+    # Only checks if user is authenticated
+    if not is_authenticated():
+        return {"error": "Unauthorized"}, 401
+    
+    # Gets _id from user input (VULNERABLE!)
+    user_id = request.args.get('_id')
+    
+    # No check if current user owns this report!
+    report = db.get_report_by_user_id(user_id)
+    
+    return report
+```
+
+#### Secure v2 Implementation ✅
+```python
+@app.route('/api/v2/download-report')
+def download_report_v2():
+    # Checks if user is authenticated
+    if not is_authenticated():
+        return {"error": "Unauthorized"}, 401
+    
+    # Gets user_id from SESSION, not from user input
+    current_user_id = get_user_from_session()
+    
+    # Only returns THEIR report
+    report = db.get_report_by_user_id(current_user_id)
+    
+    return report
+```
+
+**The Fix**: v2 properly uses the session-derived `user_id` instead of accepting it from user input.
+
+**The Problem**: v1 is still accessible and exploitable!
+
+---
+
+## Remediation Recommendations
+
+### Immediate Actions
+
+1.  **Disable Legacy API v1**
+    ```python
+    @app.route('/api/v1/<path:path>')
+    def deprecated_api(path):
+        return {"error": "API v1 is deprecated. Please use v2."}, 410
+    ```
+
+2.  **Implement Object-Level Authorization**
+    ```python
+    def require_ownership(user_id, resource_id):
+        resource = db.get_resource(resource_id)
+        if resource.owner_id != user_id:
+            abort(403)
+    ```
+
+3.  **Remove Direct Object References**
+    - Don't accept `_id` from user input
+    - Always derive resource ownership from session/token
+
+4.  **Fix Username Enumeration**
+    - Remove usernames from transaction history (use "User #123")
+    - Restrict `/api/v1/user/details` to only return current user's details
+
+### Long-Term Security Improvements
+
+- [ ] Implement API versioning deprecation policy
+- [ ] Audit all endpoints for authorization checks
+- [ ] Use indirect object references (mapping tables)
+- [ ] Implement comprehensive logging for access attempts
+- [ ] Add rate limiting to prevent enumeration
+- [ ] Security code review for all API endpoints
+- [ ] Penetration testing before deprecating old versions
+
+---
+
+## OWASP Mapping
+
+| **OWASP Top 10 2021** | **Vulnerability** |
+|---|---|
+| **A01:2021 - Broken Access Control** | IDOR on report download, user details enumeration |
+| **A01:2023 - BOLA (API)** | Missing object-level authorization on v1 endpoints |
+
+---
+
+## Key Takeaways
+
+### What I Learned
+
+1.  **API Versioning ≠ Security**: Just because a new secure version exists doesn't mean old versions are disabled
+2.  **Authorization vs Authentication**: App verified WHO I was (authentication) but not WHAT I could access (authorization)
+3.  **Chaining Vulnerabilities**: Small info leaks (username) + IDOR = Full compromise
+4.  **Test Legacy Endpoints**: Always enumerate and test all API versions (v0, v1, v2, beta, dev)
+5.  **Object References**: Any user-controllable ID parameter is a potential IDOR
+
+### Practical Application
+
+This vulnerability pattern is **extremely common** in real-world applications:
+- Bug bounty programs frequently reward IDOR findings
+- Many companies maintain legacy APIs for backward compatibility
+- Authorization issues are #1 in OWASP API Security Top 10
+
+---
+
+## Tools Used
+
+- **Burp Suite** - Proxy, Intruder, Repeater
+- **Browser DevTools** - Network tab for API analysis
+- **curl** - Manual request testing
+
+---
+
+## References
+
+- [[API-Versioning-Authorization-Cheatsheet]]
+- [OWASP API Security Top 10](https://owasp.org/www-project-api-security/)
+- [PortSwigger - Access Control](https://portswigger.net/web-security/access-control)
+- [HackTricks - IDOR](https://book.hacktricks.xyz/pentesting-web/idor)
+
+---
+
+## Flag
+
+```
+HTB{n0t_s0_3asy_1d0r}
+```
+
+---
+
+**Date Completed**: 2025-12-21  
+**Time Spent**: ~2 hours  
+**Difficulty Rating**: ⭐⭐☆☆☆ (Easy - Good for learning IDOR fundamentals)
